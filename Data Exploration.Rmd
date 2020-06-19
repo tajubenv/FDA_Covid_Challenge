@@ -1,0 +1,45 @@
+---
+title: "Data Exploration"
+output: html_notebook
+---
+
+```{r setup}
+library(tidyverse)
+library(readr)
+```
+
+```{r file_import}
+train_path <- "data/train"
+
+conditions_train <- read_csv(file.path(train_path, "conditions.csv"))
+patients_train <- read_csv(file.path(train_path, "patients.csv"))
+observations_train <- read_csv(file.path(train_path, "observations.csv"))
+care_plans_train <- read_csv(file.path(train_path, "careplans.csv"))
+encounters_train <- read_csv(file.path(train_path, "encounters.csv"))
+devices_train <- read_csv(file.path(train_path, "devices.csv"))
+supplies_train <- read_csv(file.path(train_path, "supplies.csv"))
+procedures_train <- read_csv(file.path(train_path, "procedures.csv"))
+medications_train <- read_csv(file.path(train_path, "medications.csv"))
+```
+
+```{r condition_info}
+head(conditions_train)
+summary(conditions_train)
+
+covid_patient_id <- filter(conditions_train, CODE == 840539006) %>%
+  select(PATIENT) %>% unique() %>% unlist()
+```
+
+
+
+```{r}
+head(patients_train)
+summary(patients_train)
+```
+
+
+
+
+
+
+
