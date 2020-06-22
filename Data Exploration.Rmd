@@ -2,44 +2,353 @@
 title: "Data Exploration"
 output: html_notebook
 ---
+# LOAD LIBRARIES
 
 ```{r setup}
 library(tidyverse)
 library(readr)
+library(lubridate)
+library(modelr)
 ```
 
-```{r file_import}
+## TRAIN FILE IMPORT
+
+```{r file_import, warning=FALSE, message=FALSE}
 train_path <- "data/train"
 
 conditions_train <- read_csv(file.path(train_path, "conditions.csv"))
 patients_train <- read_csv(file.path(train_path, "patients.csv"))
-observations_train <- read_csv(file.path(train_path, "observations.csv"))
-care_plans_train <- read_csv(file.path(train_path, "careplans.csv"))
+observations_train <- read.csv(file.path(train_path, "observations.csv")) %>% as_tibble()
+#care_plans_train <- read_csv(file.path(train_path, "careplans.csv"))
 encounters_train <- read_csv(file.path(train_path, "encounters.csv"))
-devices_train <- read_csv(file.path(train_path, "devices.csv"))
-supplies_train <- read_csv(file.path(train_path, "supplies.csv"))
+#devices_train <- read_csv(file.path(train_path, "devices.csv"))
+#supplies_train <- read_csv(file.path(train_path, "supplies.csv"))
 procedures_train <- read_csv(file.path(train_path, "procedures.csv"))
-medications_train <- read_csv(file.path(train_path, "medications.csv"))
+#medications_train <- read_csv(file.path(train_path, "medications.csv"))
 ```
 
-```{r condition_info}
-head(conditions_train)
-summary(conditions_train)
+## GENERATE RESPONSE ID'S
 
+```{r example_transformations}
+## COVID19 Diagnosed Patients
 covid_patient_id <- filter(conditions_train, CODE == 840539006) %>%
+  select(PATIENT) %>% unique() %>% unlist()
+
+## COVID19 Negative Tests
+negative_covid_patient_ids <- observations_train %>%
+  filter(CODE == "94531-1" & VALUE == "Not detected (qualifier value)") %>%
+  select(PATIENT) %>% unique() %>% unlist()
+
+## COVID19 Positive Tests
+positive_covid_patient_ids <- observations_train %>%
+  filter(CODE == "94531-1" & VALUE == "Detected (qualifier value)") %>%
+  select(PATIENT) %>% unique() %>% unlist()
+
+## Hospitalized patients with days
+inpatient_ids <- encounters_train %>% 
+  filter(REASONCODE == 840539006 & CODE == 1505002) %>% 
+  mutate(days_hosp = as.numeric(difftime(STOP, START, units = "days"))) %>%
+  select(PATIENT, days_hosp) #%>% unique() %>% unlist()
+
+## ICU patients with days
+icu_ids <- encounters_train %>%
+  filter(PATIENT %in% covid_patient_id & CODE == 305351004) %>%
+  mutate(days_icu = as.numeric(difftime(STOP, START, units = "days"))) %>%
+  select(PATIENT, days_icu)
+
+
+## Ventilated Patients
+vent_ids <- procedures_train %>%
+  filter(PATIENT %in% covid_patient_id & CODE == 26763009) %>%
+  select(PATIENT) %>% unique() %>% unlist()
+```
+
+# GENERATE RESPONSE VARIABLES
+
+```{r patient_consolidate}
+covid_patients <- patients_train %>%
+  mutate(covid_diagnosis = Id %in% covid_patient_id, ## IDENTIFY DIAGNOSED PATIENTS
+         covid_positive_test = Id %in% positive_covid_patient_ids,  ## IDENTIFY POSITIVE TESTS
+         covid_negative_test = Id %in% negative_covid_patient_ids,  ## IDENTIFY NEGATIVE TESTS
+         hosp_status = Id %in% unlist(unique(inpatient_ids$PATIENT)),
+         deceased_status = Id %in% covid_patient_id & !is.na(DEATHDATE),
+         survival_status = !deceased_status,
+         vent_status = Id %in% vent_ids) %>%
+  left_join(inpatient_ids, by = c("Id" = "PATIENT")) %>% ## ADD HOSPITALIZED DAYS 
+  mutate(days_hosp = case_when(!is.na(days_hosp) ~ days_hosp,
+                               is.na(days_hosp) ~ 0)) %>%
+  left_join(icu_ids, by = c("Id" = "PATIENT")) %>% ## ADD ICU DAYS 
+  mutate(days_icu = case_when(!is.na(days_icu) ~ days_icu,
+                               is.na(days_icu) ~ 0))
+  
+summary(covid_patients[,(ncol(covid_patients)-7):ncol(covid_patients)])
+```
+
+# MODELING
+
+```{r models}
+## ALL EXAMPLE MODELS
+
+## All examples models just use birthdate
+covid_patients <- covid_patients %>%
+  mutate(days_since_epoch = as.numeric(BIRTHDATE))
+
+only_covid_patients <- covid_patients %>%
+  filter(covid_diagnosis == TRUE)
+
+## COVID 19 POSITIVE MODEL, 0-1 FOR LIKELIHOOD OF COVID STATUS
+covid_pos_mod <- glm(formula = covid_diagnosis ~ days_since_epoch,
+                     family = binomial(link="logit"),
+                     data = covid_patients)
+
+covid_patients <- covid_patients %>% 
+  add_predictions(covid_pos_mod, var = "covid_positive_pred", type = "response")
+
+## DAYS HOSPITALIZED MODEL, # of days, including fractional of time in hospital
+## negative patients should be 0
+days_hosp_mod <- glm(formula = days_hosp ~ days_since_epoch,
+                     family = gaussian,
+                     data = only_covid_patients)
+
+only_covid_patients_pred <- only_covid_patients %>%
+  add_predictions(days_hosp_mod, var = "days_hosp_pred") %>%
+  select(Id, days_hosp_pred)
+
+covid_patients <- covid_patients %>%
+  left_join(only_covid_patients_pred, by = "Id") %>%  
+  mutate(days_hosp_pred = case_when(!is.na(days_hosp_pred) ~ days_hosp_pred,
+                               is.na(days_hosp_pred) ~ 0))
+
+## DAYS ICU MODEL, # of days, including fractional of time in hospital
+## negative patients should be 0
+days_icu_mod <- glm(formula = days_icu ~ days_since_epoch,
+                     family = gaussian,
+                     data = only_covid_patients)
+
+only_covid_patients_pred <- only_covid_patients %>%
+  add_predictions(days_icu_mod, var = "days_icu_pred") %>%
+  select(Id, days_icu_pred)
+
+covid_patients <- covid_patients %>%
+  left_join(only_covid_patients_pred, by = "Id") %>%  
+  mutate(days_icu_pred = case_when(!is.na(days_icu_pred) ~ days_icu_pred,
+                               is.na(days_icu_pred) ~ 0))
+
+
+## CONTROLLED VENTILATION MODEL,# of days, including fractional of time in hospital
+## negative patients should be 0
+vent_mod <- glm(formula = vent_status ~ days_since_epoch,
+                     family = binomial(link="logit"),
+                     data = only_covid_patients)
+
+only_covid_patients_pred <- only_covid_patients %>%
+  add_predictions(vent_mod, var = "vent_pred", type = "response") %>%
+  select(Id, vent_pred)
+
+covid_patients <- covid_patients %>%
+  left_join(only_covid_patients_pred, by = "Id") %>%  
+  mutate(vent_pred = case_when(!is.na(vent_pred) ~ vent_pred,
+                               is.na(vent_pred) ~ 0))
+
+## SURVIVAL MODEL, 0-1 FOR LIKELIHOOD OF SURVIVAL
+## negative patients should be 1
+survival_mod <- glm(formula = survival_status ~ days_since_epoch,
+                     family = binomial(link="logit"),
+                     data = only_covid_patients)
+
+only_covid_patients_pred <- only_covid_patients %>%
+  add_predictions(survival_mod, var = "survival_pred", type = "response") %>%
+  select(Id, survival_pred)
+
+covid_patients <- covid_patients %>%
+  left_join(only_covid_patients_pred, by = "Id") %>%  
+  mutate(survival_pred = case_when(!is.na(survival_pred) ~ survival_pred,
+                               is.na(survival_pred) ~ 0))
+```
+
+# EVALUATE MODEL PERFORMANCE
+
+```{r}
+## EVALUATE MODEL PERFORMANCE
+
+##TBD
+
+
+```
+
+```{r, free_memory}
+## Remove data from memory for RAM considerations
+rm(conditions_train, patients_train, observations_train, encounters_train, procedures_train) 
+```
+
+## TEST FILE IMPORT
+
+```{r, warning=FALSE, message=FALSE}
+test_path <- "data/test"
+
+conditions_test <- read_csv(file.path(test_path, "conditions.csv"))
+patients_test <- read_csv(file.path(test_path, "patients.csv"))
+observations_test <- read.csv(file.path(test_path, "observations.csv")) %>% as_tibble()
+#care_plans_test <- read_csv(file.path(test_path, "careplans.csv"))
+encounters_test <- read_csv(file.path(test_path, "encounters.csv"))
+#devices_test <- read_csv(file.path(test_path, "devices.csv"))
+#supplies_test <- read_csv(file.path(test_path, "supplies.csv"))
+procedures_test <- read_csv(file.path(test_path, "procedures.csv"))
+#medications_test <- read_csv(file.path(test_path, "medications.csv"))
+```
+
+## TEST FILE TRANSFORMATIONS
+
+(THIS DOESN'T ACTUALLY MATTER BECAUSE THE RELEVANT OUTCOMES ARE NOT INCLUDED)
+
+```{r example_transformations_test}
+## COVID19 Diagnosed Patients
+covid_patient_id <- filter(conditions_test, CODE == 840539006) %>%
+  select(PATIENT) %>% unique() %>% unlist()
+
+## COVID19 Negative Tests
+negative_covid_patient_ids <- observations_test %>%
+  filter(CODE == "94531-1" & VALUE == "Not detected (qualifier value)") %>%
+  select(PATIENT) %>% unique() %>% unlist()
+
+## COVID19 Positive Tests
+positive_covid_patient_ids <- observations_test %>%
+  filter(CODE == "94531-1" & VALUE == "Detected (qualifier value)") %>%
+  select(PATIENT) %>% unique() %>% unlist()
+
+## Hospitalized patients with days
+inpatient_ids <- encounters_test %>% 
+  filter(REASONCODE == 840539006 & CODE == 1505002) %>% 
+  mutate(days_hosp = as.numeric(difftime(STOP, START, units = "days"))) %>%
+  select(PATIENT, days_hosp) #%>% unique() %>% unlist()
+
+## ICU patients with days
+icu_ids <- encounters_test %>%
+  filter(PATIENT %in% covid_patient_id & CODE == 305351004) %>%
+  mutate(days_icu = as.numeric(difftime(STOP, START, units = "days"))) %>%
+  select(PATIENT, days_icu)
+
+
+## Ventilated Patients
+vent_ids <- procedures_test %>%
+  filter(PATIENT %in% covid_patient_id & CODE == 26763009) %>%
   select(PATIENT) %>% unique() %>% unlist()
 ```
 
 
-
-```{r}
-head(patients_train)
-summary(patients_train)
+```{r patient_consolidate_test}
+covid_patients_test <- patients_test %>%
+  mutate(covid_diagnosis = Id %in% covid_patient_id, ## IDENTIFY DIAGNOSED PATIENTS
+         covid_positive_test = Id %in% positive_covid_patient_ids,  ## IDENTIFY POSITIVE TESTS
+         covid_negative_test = Id %in% negative_covid_patient_ids,  ## IDENTIFY NEGATIVE TESTS
+         hosp_status = Id %in% unlist(unique(inpatient_ids$PATIENT)),
+         deceased_status = Id %in% covid_patient_id & !is.na(DEATHDATE),
+         survival_status = !deceased_status,
+         vent_status = Id %in% vent_ids) %>%
+  left_join(inpatient_ids, by = c("Id" = "PATIENT")) %>% ## ADD HOSPITALIZED DAYS 
+  mutate(days_hosp = case_when(!is.na(days_hosp) ~ days_hosp,
+                               is.na(days_hosp) ~ 0)) %>%
+  left_join(icu_ids, by = c("Id" = "PATIENT")) %>% ## ADD ICU DAYS 
+  mutate(days_icu = case_when(!is.na(days_icu) ~ days_icu,
+                               is.na(days_icu) ~ 0))
+  
+summary(covid_patients_test[,(ncol(covid_patients_test)-7):ncol(covid_patients_test)])
 ```
 
+# APPLY PREDICTIONS TO TEST DATA
+
+```{r}
+## All examples models just use birthdate
+covid_patients_test <- covid_patients_test %>%
+  mutate(days_since_epoch = as.numeric(BIRTHDATE))
 
 
 
+## COVID 19 POSITIVE MODEL, 0-1 FOR LIKELIHOOD OF COVID STATUS
+covid_patients_test <- covid_patients_test %>% 
+  add_predictions(covid_pos_mod, var = "covid_positive_pred", type = "response")
 
 
+## TBD: SHOULD WE FILTER OUR DATA BY WHAT OUR PREDICTED CASES ARE?
+## CURRENT EXAMPLE MODELS ARE ONLY ON COVID PATIENTS
+
+only_covid_patients_test <- covid_patients_test %>%
+  filter(covid_positive_pred > .5)
+
+## DAYS HOSPITALIZED MODEL, # of days, including fractional of time in hospital
+## negative patients should be 0
+only_covid_patients_test_pred <- only_covid_patients_test %>%
+  add_predictions(days_hosp_mod, var = "days_hosp_pred") %>%
+  select(Id, days_hosp_pred)
+
+covid_patients_test <- covid_patients_test %>%
+  left_join(only_covid_patients_test_pred, by = "Id") %>%  
+  mutate(days_hosp_pred = case_when(!is.na(days_hosp_pred) ~ days_hosp_pred,
+                               is.na(days_hosp_pred) ~ 0))
+
+## DAYS ICU MODEL, # of days, including fractional of time in hospital
+## negative patients should be 0
+only_covid_patients_test_pred <- only_covid_patients_test %>%
+  add_predictions(days_icu_mod, var = "days_icu_pred") %>%
+  select(Id, days_icu_pred)
+
+covid_patients_test <- covid_patients_test %>%
+  left_join(only_covid_patients_test_pred, by = "Id") %>%  
+  mutate(days_icu_pred = case_when(!is.na(days_icu_pred) ~ days_icu_pred,
+                               is.na(days_icu_pred) ~ 0))
+
+
+## CONTROLLED VENTILATION MODEL,# of days, including fractional of time in hospital
+## negative patients should be 0
+only_covid_patients_test_pred <- only_covid_patients_test %>%
+  add_predictions(vent_mod, var = "vent_pred", type = "response") %>%
+  select(Id, vent_pred)
+
+covid_patients_test <- covid_patients_test %>%
+  left_join(only_covid_patients_test_pred, by = "Id") %>%  
+  mutate(vent_pred = case_when(!is.na(vent_pred) ~ vent_pred,
+                               is.na(vent_pred) ~ 0))
+
+## SURVIVAL MODEL, 0-1 FOR LIKELIHOOD OF SURVIVAL
+## negative patients should be 1
+only_covid_patients_test_pred <- only_covid_patients_test %>%
+  add_predictions(survival_mod, var = "survival_pred", type = "response") %>%
+  select(Id, survival_pred)
+
+covid_patients_test <- covid_patients_test %>%
+  left_join(only_covid_patients_test_pred, by = "Id") %>%  
+  mutate(survival_pred = case_when(!is.na(survival_pred) ~ survival_pred,
+                               is.na(survival_pred) ~ 0))
+```
+
+```{r, free_memory_test}
+## Remove data from memory for RAM considerations
+rm(conditions_test, patients_test, observations_test, encounters_test, procedures_test) 
+```
+
+# OUTPUT RESULTS FILES
+
+```{r, output_predictions}
+results_path <- "results"
+
+## COVID19 STATUS
+select(covid_patients_test, Id, covid_positive_pred) %>%
+  write_csv(path = file.path(results_path, "covid_19_status.csv"), col_names = FALSE)
+
+## DAYS HOSPITALIZED
+select(covid_patients_test, Id, days_hosp_pred) %>%
+  write_csv(path = file.path(results_path, "days_hospitalized.csv"), col_names = FALSE)
+
+## DAYS IN ICU
+select(covid_patients_test, Id, days_icu_pred) %>%
+  write_csv(path = file.path(results_path, "days_icu.csv"), col_names = FALSE)
+
+## CONTROLLED VENTILATION STATUS
+select(covid_patients_test, Id, vent_pred) %>%
+  write_csv(path = file.path(results_path, "vent_status.csv"), col_names = FALSE)
+
+## ALIVE OR DECEASED STATUS
+select(covid_patients_test, Id, survival_pred) %>%
+  write_csv(path = file.path(results_path, "deceased_status.csv"), col_names = FALSE)
+```
 

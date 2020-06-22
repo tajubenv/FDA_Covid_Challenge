@@ -1,5 +1,6 @@
 # gitignore
 data
+results
 Backup_Codes.txt
 
 # History files
@@ -44,3 +45,4 @@ vignettes/*.pdf
 
 # pkgdown site
 docs/
+.Rproj.user
